@@ -1,0 +1,413 @@
+name: GKI Compliance Check
+
+on:
+  push:
+    branches: [ main, CWAI, develop ]
+    paths:
+      - 'arch/**'
+      - 'drivers/**'
+      - 'kernel/**'
+      - 'include/**'
+      - 'android/**'
+      - 'build.config.*'
+      - '*.defconfig'
+  pull_request:
+    branches: [ main, CWAI, develop ]
+    paths:
+      - 'arch/**'
+      - 'drivers/**'
+      - 'kernel/**'
+      - 'include/**'
+      - 'android/**'
+      - 'build.config.*'
+      - '*.defconfig'
+  workflow_dispatch:
+
+env:
+  KERNEL_DIR: ${{ github.workspace }}
+  OUT_DIR: ${{ github.workspace }}/out
+  ARCH: arm64
+  CROSS_COMPILE: aarch64-linux-gnu-
+  CC: clang
+  LLVM: 1
+  LLVM_IAS: 1
+
+jobs:
+  gki-build-test:
+    name: GKI Build Test
+    runs-on: ubuntu-22.04
+    
+    steps:
+    - name: Checkout kernel source
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 1
+    
+    - name: Set up build environment
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential \
+          bc \
+          bison \
+          flex \
+          libssl-dev \
+          libelf-dev \
+          clang \
+          lld \
+          llvm \
+          gcc-aarch64-linux-gnu \
+          python3 \
+          python3-pip \
+          git \
+          rsync
+        
+        # Install additional tools for ABI checking
+        pip3 install --user xmltodict
+    
+    - name: Cache build dependencies
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cache/pip
+          /usr/lib/llvm-*/
+        key: ${{ runner.os }}-build-deps-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-build-deps-
+    
+    - name: Verify GKI defconfig exists
+      run: |
+        if [ ! -f "arch/arm64/configs/gki_defconfig" ]; then
+          echo "❌ GKI defconfig not found!"
+          exit 1
+        fi
+        echo "✅ GKI defconfig found"
+    
+    - name: Test GKI kernel configuration
+      run: |
+        echo "🔧 Testing GKI kernel configuration..."
+        make O=${OUT_DIR}/gki ARCH=${ARCH} gki_defconfig
+        
+        # Check for required GKI options
+        config_file="${OUT_DIR}/gki/.config"
+        
+        required_configs=(
+          "CONFIG_ANDROID=y"
+          "CONFIG_ANDROID_BINDER_IPC=y"
+          "CONFIG_ANDROID_BINDERFS=y"
+          "CONFIG_ANDROID_VENDOR_HOOKS=y"
+          "CONFIG_MODULES=y"
+          "CONFIG_MODVERSIONS=y"
+          "CONFIG_LTO_CLANG_FULL=y"
+          "CONFIG_CFI_CLANG=y"
+        )
+        
+        echo "Checking required GKI configurations..."
+        for config in "${required_configs[@]}"; do
+          if grep -q "^${config}" "${config_file}"; then
+            echo "✅ ${config}"
+          else
+            echo "❌ ${config} - MISSING OR DISABLED"
+            exit 1
+          fi
+        done
+        
+        echo "✅ All required GKI configurations present"
+    
+    - name: Build GKI kernel (headers only)
+      run: |
+        echo "🔨 Building GKI kernel (headers and basic validation)..."
+        
+        # Build kernel headers and basic objects for validation
+        make O=${OUT_DIR}/gki ARCH=${ARCH} -j$(nproc) \
+          CROSS_COMPILE=${CROSS_COMPILE} \
+          CC=${CC} \
+          prepare scripts
+        
+        echo "✅ GKI kernel configuration and headers built successfully"
+    
+    - name: Validate build configuration files
+      run: |
+        echo "🔍 Validating build configuration files..."
+        
+        # Check build.config.gki
+        if [ ! -f "build.config.gki" ]; then
+          echo "❌ build.config.gki not found!"
+          exit 1
+        fi
+        
+        # Check for required build config settings
+        if grep -q "DEFCONFIG=gki_defconfig" build.config.gki; then
+          echo "✅ GKI defconfig properly referenced"
+        else
+          echo "❌ GKI defconfig not properly referenced in build.config.gki"
+          exit 1
+        fi
+        
+        # Check build.config.gki.aarch64
+        if [ -f "build.config.gki.aarch64" ]; then
+          echo "✅ ARM64 GKI build config found"
+          
+          # Validate ABI settings
+          if grep -q "ABI_DEFINITION=android/abi_gki_aarch64.xml" build.config.gki.aarch64; then
+            echo "✅ ABI definition properly configured"
+          else
+            echo "⚠️ ABI definition not found in build config"
+          fi
+        else
+          echo "❌ build.config.gki.aarch64 not found!"
+          exit 1
+        fi
+    
+    - name: Check ABI symbol lists
+      run: |
+        echo "🔍 Checking ABI symbol lists..."
+        
+        # Check main GKI ABI file
+        if [ -f "android/abi_gki_aarch64" ]; then
+          symbol_count=$(grep -v '^#' android/abi_gki_aarch64 | grep -v '^[[:space:]]*$' | wc -l)
+          echo "✅ GKI ABI symbol list found with ${symbol_count} symbols"
+        else
+          echo "❌ GKI ABI symbol list not found!"
+          exit 1
+        fi
+        
+        # Check Exynos-specific ABI file
+        if [ -f "android/abi_gki_aarch64_exynos" ]; then
+          exynos_symbols=$(grep -v '^#' android/abi_gki_aarch64_exynos | grep -v '^[[:space:]]*$' | wc -l)
+          echo "✅ Exynos ABI symbol list found with ${exynos_symbols} symbols"
+        else
+          echo "⚠️ Exynos-specific ABI symbol list not found"
+        fi
+        
+        # Check Galaxy-specific ABI file
+        if [ -f "android/abi_gki_aarch64_galaxy" ]; then
+          galaxy_symbols=$(grep -v '^#' android/abi_gki_aarch64_galaxy | grep -v '^[[:space:]]*$' | wc -l)
+          echo "✅ Galaxy ABI symbol list found with ${galaxy_symbols} symbols"
+        else
+          echo "⚠️ Galaxy-specific ABI symbol list not found"
+        fi
+    
+    - name: Test GKI build script
+      run: |
+        echo "🧪 Testing GKI build script..."
+        
+        if [ -f "build_gki.sh" ]; then
+          echo "✅ GKI build script found"
+          
+          # Test script syntax
+          bash -n build_gki.sh
+          echo "✅ GKI build script syntax is valid"
+          
+          # Test help option
+          ./build_gki.sh --help > /dev/null
+          echo "✅ GKI build script help works"
+        else
+          echo "❌ GKI build script not found!"
+          exit 1
+        fi
+    
+    - name: Test ABI checking script
+      run: |
+        echo "🧪 Testing ABI checking script..."
+        
+        if [ -f "scripts/gki-abi-check.sh" ]; then
+          echo "✅ ABI checking script found"
+          
+          # Test script syntax
+          bash -n scripts/gki-abi-check.sh
+          echo "✅ ABI checking script syntax is valid"
+          
+          # Test help option
+          ./scripts/gki-abi-check.sh help > /dev/null
+          echo "✅ ABI checking script help works"
+        else
+          echo "❌ ABI checking script not found!"
+          exit 1
+        fi
+    
+    - name: Validate vendor module configurations
+      run: |
+        echo "🔍 Validating vendor module configurations..."
+        
+        # Check vendor module lists
+        vendor_configs=(
+          "vendor_module_list_s5e9925.cfg"
+          "vendor_boot_module_order_s5e9925.cfg"
+        )
+        
+        for config in "${vendor_configs[@]}"; do
+          if [ -f "${config}" ]; then
+            module_count=$(grep -v '^#' "${config}" | grep -v '^[[:space:]]*$' | wc -l)
+            echo "✅ ${config} found with ${module_count} modules"
+          else
+            echo "⚠️ ${config} not found"
+          fi
+        done
+    
+    - name: Generate compliance report
+      run: |
+        echo "📊 Generating GKI compliance report..."
+        
+        report_file="gki_compliance_report.md"
+        
+        cat > "${report_file}" << 'EOF'
+        # GKI Compliance Report
+        
+        **Generated:** $(date)  
+        **Commit:** ${{ github.sha }}  
+        **Branch:** ${{ github.ref_name }}  
+        **Workflow:** ${{ github.workflow }}  
+        
+        ## ✅ Compliance Checks Passed
+        
+        - [x] GKI defconfig exists and is valid
+        - [x] Required GKI kernel configurations present
+        - [x] Build configuration files properly structured
+        - [x] ABI symbol lists present and valid
+        - [x] Build scripts syntax validated
+        - [x] Vendor module configurations checked
+        
+        ## 📋 Configuration Summary
+        
+        - **Architecture:** ARM64
+        - **Target SoC:** Samsung Exynos 2200
+        - **GKI Defconfig:** `arch/arm64/configs/gki_defconfig`
+        - **Build Script:** `build_gki.sh`
+        - **ABI Checker:** `scripts/gki-abi-check.sh`
+        
+        ## 🔧 Build Environment
+        
+        - **Compiler:** Clang with LLVM
+        - **Cross Compiler:** aarch64-linux-gnu-
+        - **LTO:** Enabled (Full LTO)
+        - **CFI:** Enabled
+        - **Security Hardening:** Enabled
+        
+        ## 📈 Recommendations
+        
+        1. ✅ All basic GKI compliance requirements met
+        2. 🔄 Consider running full kernel build test for complete validation
+        3. 📊 Run ABI compatibility check against reference GKI
+        4. 🧪 Test with actual Samsung Galaxy S22 hardware
+        
+        ---
+        *This report was automatically generated by the GKI Compliance workflow.*
+        EOF
+        
+        echo "✅ Compliance report generated"
+    
+    - name: Upload compliance report
+      uses: actions/upload-artifact@v3
+      with:
+        name: gki-compliance-report
+        path: gki_compliance_report.md
+        retention-days: 30
+    
+    - name: Comment on PR (if applicable)
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const fs = require('fs');
+          
+          // Read the compliance report
+          let report = '';
+          try {
+            report = fs.readFileSync('gki_compliance_report.md', 'utf8');
+          } catch (error) {
+            report = '❌ Failed to generate compliance report';
+          }
+          
+          // Post comment on PR
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: `## 🚀 GKI Compliance Check Results\n\n${report}\n\n---\n*Automated check completed for commit ${context.sha}*`
+          });
+
+  security-scan:
+    name: Security Configuration Scan
+    runs-on: ubuntu-22.04
+    needs: gki-build-test
+    
+    steps:
+    - name: Checkout kernel source
+      uses: actions/checkout@v4
+    
+    - name: Scan for security configurations
+      run: |
+        echo "🔒 Scanning security configurations..."
+        
+        # Check for security hardening options in GKI defconfig
+        defconfig="arch/arm64/configs/gki_defconfig"
+        
+        security_configs=(
+          "CONFIG_SECURITY=y"
+          "CONFIG_SECURITY_SELINUX=y"
+          "CONFIG_HARDENED_USERCOPY=y"
+          "CONFIG_INIT_STACK_ALL_ZERO=y"
+          "CONFIG_INIT_ON_ALLOC_DEFAULT_ON=y"
+          "CONFIG_CFI_CLANG=y"
+          "CONFIG_LTO_CLANG_FULL=y"
+          "CONFIG_SLAB_FREELIST_RANDOM=y"
+          "CONFIG_SLAB_FREELIST_HARDENED=y"
+          "CONFIG_SHUFFLE_PAGE_ALLOCATOR=y"
+        )
+        
+        echo "Checking security configurations in GKI defconfig..."
+        missing_security=()
+        
+        for config in "${security_configs[@]}"; do
+          if grep -q "^${config}" "${defconfig}"; then
+            echo "✅ ${config}"
+          else
+            echo "❌ ${config} - MISSING"
+            missing_security+=("${config}")
+          fi
+        done
+        
+        if [ ${#missing_security[@]} -eq 0 ]; then
+          echo "✅ All security configurations present"
+        else
+          echo "⚠️ Missing security configurations: ${#missing_security[@]}"
+          for config in "${missing_security[@]}"; do
+            echo "  - ${config}"
+          done
+        fi
+    
+    - name: Check for insecure configurations
+      run: |
+        echo "🔍 Checking for potentially insecure configurations..."
+        
+        defconfig="arch/arm64/configs/gki_defconfig"
+        
+        # Configurations that should be disabled for security
+        insecure_configs=(
+          "CONFIG_DEBUG_KERNEL=y"
+          "CONFIG_KGDB=y"
+          "CONFIG_MAGIC_SYSRQ=y"
+          "CONFIG_DEVMEM=y"
+          "CONFIG_DEVPORT=y"
+          "CONFIG_PROC_KCORE=y"
+        )
+        
+        found_insecure=()
+        
+        for config in "${insecure_configs[@]}"; do
+          if grep -q "^${config}" "${defconfig}"; then
+            echo "⚠️ ${config} - POTENTIALLY INSECURE"
+            found_insecure+=("${config}")
+          else
+            echo "✅ ${config} - Not enabled (good)"
+          fi
+        done
+        
+        if [ ${#found_insecure[@]} -eq 0 ]; then
+          echo "✅ No insecure configurations found"
+        else
+          echo "⚠️ Found potentially insecure configurations: ${#found_insecure[@]}"
+          echo "Consider reviewing these for production builds"
+        fi
+

@@ -1,3 +1,12 @@
 DEFCONFIG=gki_defconfig
 POST_DEFCONFIG_CMDS="check_defconfig"
 
+# GKI specific build settings
+GKI_BUILD=1
+TRIM_NONLISTED_KMI=1
+KMI_SYMBOL_LIST_STRICT_MODE=1
+KMI_ENFORCED=1
+
+# Enable ABI monitoring
+TIDY_ABI=1
+
